@@ -13,9 +13,14 @@
 
 #define BUFLEN  2048
 
-#if defined(__APPLE__) || defined( __FreeBSD__)
+#if defined(__APPLE__) || defined(__FreeBSD__)
 #include <sys/ioctl.h>
 #include <sys/disk.h>
+#endif
+
+// In 64-bit architectures (such as arm64/aarch64, x86_64, macOS, and FreeBSD), 
+// off_t is natively 64-bit, eliminating the need for the explicit use of lseek64.
+#if defined(__APPLE__) || defined(__FreeBSD__) || defined(__aarch64__) || defined(__x86_64__)
 #define lseek64 lseek
 #define loff_t off_t
 #endif
