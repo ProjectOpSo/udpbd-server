@@ -1,8 +1,11 @@
-BIN=udpbd-server
-OBJS=main.o
+BIN = udpbd-server
+OBJS = main.o
 
-udpbd-server: $(OBJS)
-	g++ -o $@ $^
+CXX ?= g++
+CXXFLAGS ?= -O2
+
+$(BIN): $(OBJS)
+	$(CXX) $(LDFLAGS) -o $@ $^ $(LDLIBS)
 
 all: $(BIN)
 
@@ -11,3 +14,5 @@ clean:
 
 install: $(BIN)
 	cp $(BIN) $(PS2DEV)/bin
+
+.PHONY: all clean install
