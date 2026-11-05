@@ -1,3 +1,10 @@
+#if defined(__APPLE__)
+#define _DARWIN_USE_64_BIT_INODE 1
+#endif
+#ifndef _FILE_OFFSET_BITS
+#define _FILE_OFFSET_BITS 64
+#endif
+
 #include <iostream>
 #include <exception>
 
@@ -8,6 +15,7 @@
 #include <fcntl.h>
 #include <arpa/inet.h>
 #include <sys/socket.h>
+#include <inttypes.h>
 
 #include "udpbd.h"
 
@@ -16,17 +24,6 @@
 #if defined(__APPLE__) || defined(__FreeBSD__)
 #include <sys/ioctl.h>
 #include <sys/disk.h>
-#endif
-
-// In 64-bit architectures (such as arm64/aarch64, x86_64, macOS, and FreeBSD), 
-// off_t is natively 64-bit, eliminating the need for the explicit use of lseek64.
-#if defined(__APPLE__) || defined(__FreeBSD__) || defined(__aarch64__) || defined(__x86_64__)
-#define lseek64 lseek
-#define loff_t off_t
-#endif
-
-#if defined(__APPLE__)
-#define _DARWIN_USE_64_BIT_INODE 1
 #endif
 
 using namespace std;
@@ -50,9 +47,10 @@ public:
                 throw runtime_error(string("unable to open file ") + sFileName);
         }
 
-        // Get the size of the file
-        _fsize = lseek64(_fp, 0, SEEK_END);
-        lseek64(_fp, 0, SEEK_SET);
+        // Get the size of the file. off_t is 64-bit on 64-bit targets and
+        // _FILE_OFFSET_BITS makes it 64-bit on 32-bit glibc targets too.
+        _fsize = lseek(_fp, 0, SEEK_END);
+        lseek(_fp, 0, SEEK_SET);
 #if defined(__APPLE__)
         if (_fsize == 0) {
             uint64_t blockCount;
@@ -71,7 +69,9 @@ public:
 
         printf("Opened '%s' as Block Device\n", sFileName);
         printf(" - %s\n", _read_only ? "read-only" : "read/write");
-        printf(" - size = %ldMB / %ldMiB\n", _fsize / (1000*1000), _fsize / (1024*1024));
+        printf(" - size = %" PRIdMAX "MB / %" PRIdMAX "MiB\n",
+               static_cast<intmax_t>(_fsize / (1000 * 1000)),
+               static_cast<intmax_t>(_fsize / (1024 * 1024)));
     }
 
     ~CBlockDevice() {
@@ -79,22 +79,22 @@ public:
     }
 
     void seek(uint32_t sector) {
-        loff_t offset = (loff_t)sector * 512;
-        //printf("seek %d * 512 = %ld\n", sector, offset);
-        lseek64(_fp, offset, SEEK_SET);
+        off_t offset = static_cast<off_t>(sector) * 512;
+        //printf("seek %u * 512 = %jd\n", sector, static_cast<intmax_t>(offset));
+        lseek(_fp, offset, SEEK_SET);
     }
 
     void read(void *data, size_t size) {
         ssize_t rv = ::read(_fp, data, size);
-        if (rv != size)
-            printf("read error %ld != %ld\n", rv, size);
+        if (rv != static_cast<ssize_t>(size))
+            printf("read error %zd != %zu\n", rv, size);
     }
 
     void write(const void *data, size_t size) {
         ssize_t rv = ::write(_fp, data, size);
-        //printf("write %ld\n", size);
-        if (rv != size)
-            printf("write error %ld != %ld\n", rv, size);
+        //printf("write %zu\n", size);
+        if (rv != static_cast<ssize_t>(size))
+            printf("write error %zd != %zu\n", rv, size);
     }
 
     uint32_t get_sector_size()  {return 512;}
@@ -103,7 +103,7 @@ public:
 private:
     int _fp;
     bool _read_only;
-    loff_t _fsize;
+    off_t _fsize;
 };
 
 /*
@@ -142,7 +142,7 @@ public:
     void run() {
         struct sockaddr_in si_other;
         socklen_t slen = sizeof(si_other);
-        int recv_len;
+        ssize_t recv_len;
         char buf[BUFLEN];
 
         printf("Server running on port %d (0x%x)\n", UDPBD_PORT, UDPBD_PORT);
@@ -178,7 +178,7 @@ public:
 
 private:
     void print_stats() {
-        printf("Total read: %ld KiB, total write: %ld KiB", _total_read/1024, _total_write/1024);
+        printf("Total read: %" PRIu64 " KiB, total write: %" PRIu64 " KiB", _total_read/1024, _total_write/1024);
         fflush(stdout);
     }
 
@@ -188,7 +188,7 @@ private:
             _block_size        = 1 << (_block_shift + 2);
             _blocks_per_packet = RDMA_MAX_PAYLOAD / _block_size;
             _blocks_per_sector = _bd.get_sector_size() / _block_size;
-            printf("Block size changed to %d\n", _block_size);
+            printf("Block size changed to %u\n", _block_size);
         }
     }
 
@@ -241,7 +241,7 @@ private:
     void handle_cmd_read(struct sockaddr_in &si_other, struct SUDPBDv2_RWRequest *request) {
         struct SUDPBDv2_RDMA reply;
 
-        printf("\rUDPBD_CMD_READ(cmdId=%d, startSector=%d, sectorCount=%d)\n", request->hdr.cmdid, request->sector_nr, request->sector_count);
+        printf("\rUDPBD_CMD_READ(cmdId=%d, startSector=%u, sectorCount=%u)\n", request->hdr.cmdid, request->sector_nr, request->sector_count);
 
         // Optimize RDMA block size for number of sectors
         set_block_shift_sectors(request->sector_count);
@@ -276,7 +276,7 @@ private:
     }
 
     void handle_cmd_write(struct sockaddr_in &si_other, struct SUDPBDv2_RWRequest *request) {
-        printf("\rUDPBD_CMD_WRITE(cmdId=%d, startSector=%d, sectorCount=%d)\n", request->hdr.cmdid, request->sector_nr, request->sector_count);
+        printf("\rUDPBD_CMD_WRITE(cmdId=%d, startSector=%u, sectorCount=%u)\n", request->hdr.cmdid, request->sector_nr, request->sector_count);
 
         _bd.seek(request->sector_nr);
         _write_size_left = request->sector_count * 512;
@@ -287,7 +287,7 @@ private:
 
     void handle_cmd_write_rdma(struct sockaddr_in &si_other, struct SUDPBDv2_RDMA *request) {
         size_t size = request->bt.block_count * (1 << (request->bt.block_shift + 2));
-        //printf("UDPBD_CMD_WRITE_RDMA(cmdId=%d, BS=%d, BC=%d, size=%ld)\n", request->hdr.cmdid, request->bt.block_shift, request->bt.block_count, size);
+        //printf("UDPBD_CMD_WRITE_RDMA(cmdId=%d, BS=%u, BC=%u, size=%zu)\n", request->hdr.cmdid, request->bt.block_shift, request->bt.block_count, size);
 
         _bd.write(request->data, size);
         _write_size_left -= size;
