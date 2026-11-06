@@ -16,6 +16,8 @@
 #include <arpa/inet.h>
 #include <sys/socket.h>
 #include <inttypes.h>
+#include <errno.h>
+#include <stdexcept>
 
 #include "udpbd.h"
 
@@ -28,21 +30,18 @@
 
 using namespace std;
 
-
 /*
  * class CBlockDevice
  */
 class CBlockDevice
 {
 public:
-    CBlockDevice(const char *sFileName) : _read_only(false) {
-        // Open the selected file.
-        // This file will be used as the Block Device
+    CBlockDevice(const char *sFileName, bool verbose) : _read_only(false), _verbose(verbose) {
+        // Open the selected file. This file will be used as the Block Device.
         _fp = open(sFileName, _read_only ? O_RDONLY : O_RDWR);
         if (_fp < 0) {
             _read_only = true;
-
-            _fp = open(sFileName, _read_only ? O_RDONLY : O_RDWR);
+            _fp = open(sFileName, O_RDONLY);
             if (_fp < 0)
                 throw runtime_error(string("unable to open file ") + sFileName);
         }
@@ -50,7 +49,10 @@ public:
         // Get the size of the file. off_t is 64-bit on 64-bit targets and
         // _FILE_OFFSET_BITS makes it 64-bit on 32-bit glibc targets too.
         _fsize = lseek(_fp, 0, SEEK_END);
-        lseek(_fp, 0, SEEK_SET);
+        if (_fsize < 0)
+            throw runtime_error(string("unable to determine size of ") + sFileName + ": " + strerror(errno));
+        if (lseek(_fp, 0, SEEK_SET) < 0)
+            throw runtime_error(string("unable to seek ") + sFileName + ": " + strerror(errno));
 #if defined(__APPLE__)
         if (_fsize == 0) {
             uint64_t blockCount;
@@ -67,34 +69,49 @@ public:
         }
 #endif
 
-        printf("Opened '%s' as Block Device\n", sFileName);
-        printf(" - %s\n", _read_only ? "read-only" : "read/write");
-        printf(" - size = %" PRIdMAX "MB / %" PRIdMAX "MiB\n",
-               static_cast<intmax_t>(_fsize / (1000 * 1000)),
-               static_cast<intmax_t>(_fsize / (1024 * 1024)));
+        if (_verbose) {
+            printf("Opened '%s' as Block Device\n", sFileName);
+            printf(" - %s\n", _read_only ? "read-only" : "read/write");
+            printf(" - size = %" PRIdMAX "MB / %" PRIdMAX "MiB\n",
+                   static_cast<intmax_t>(_fsize / (1000 * 1000)),
+                   static_cast<intmax_t>(_fsize / (1024 * 1024)));
+        }
     }
 
     ~CBlockDevice() {
         close(_fp);
     }
 
-    void seek(uint32_t sector) {
-        off_t offset = static_cast<off_t>(sector) * 512;
-        //printf("seek %u * 512 = %jd\n", sector, static_cast<intmax_t>(offset));
-        lseek(_fp, offset, SEEK_SET);
+    void read_at(uint64_t offset, void *data, size_t size) {
+        char *out = static_cast<char *>(data);
+        size_t done = 0;
+        while (done < size) {
+            ssize_t rv = pread(_fp, out + done, size - done, static_cast<off_t>(offset + done));
+            if (rv < 0) {
+                if (errno == EINTR)
+                    continue;
+                throw runtime_error(string("read failed: ") + strerror(errno));
+            }
+            if (rv == 0)
+                throw runtime_error("unexpected end of block device while reading");
+            done += static_cast<size_t>(rv);
+        }
     }
 
-    void read(void *data, size_t size) {
-        ssize_t rv = ::read(_fp, data, size);
-        if (rv != static_cast<ssize_t>(size))
-            printf("read error %zd != %zu\n", rv, size);
-    }
-
-    void write(const void *data, size_t size) {
-        ssize_t rv = ::write(_fp, data, size);
-        //printf("write %zu\n", size);
-        if (rv != static_cast<ssize_t>(size))
-            printf("write error %zd != %zu\n", rv, size);
+    void write_at(uint64_t offset, const void *data, size_t size) {
+        const char *in = static_cast<const char *>(data);
+        size_t done = 0;
+        while (done < size) {
+            ssize_t rv = pwrite(_fp, in + done, size - done, static_cast<off_t>(offset + done));
+            if (rv < 0) {
+                if (errno == EINTR)
+                    continue;
+                throw runtime_error(string("write failed: ") + strerror(errno));
+            }
+            if (rv == 0)
+                throw runtime_error("write made no progress");
+            done += static_cast<size_t>(rv);
+        }
     }
 
     uint32_t get_sector_size()  {return 512;}
@@ -103,6 +120,7 @@ public:
 private:
     int _fp;
     bool _read_only;
+    bool _verbose;
     off_t _fsize;
 };
 
@@ -112,25 +130,26 @@ private:
 class CUDPBDServer
 {
 public:
-    CUDPBDServer(class CBlockDevice &bd) : _bd(bd), _block_shift(0), _total_read(0), _total_write(0) {
-        set_block_shift(5); // 128b blocks
+    CUDPBDServer(class CBlockDevice &bd, bool verbose) : _bd(bd), _verbose(verbose), _block_shift(0), _total_read(0), _total_write(0), _write_size_left(0), _write_offset(0) {
+        set_block_shift(5); // 128-byte blocks; protocol block sizing is unchanged.
         struct sockaddr_in si_me;
 
-        //create a UDP socket
+        // Create a UDP socket.
         if ((s = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP)) == -1) {
             throw runtime_error("socket");
         }
 
-        //bind socket to port
+        // Bind socket to port.
         memset((char *) &si_me, 0, sizeof(si_me));
         si_me.sin_family = AF_INET;
         si_me.sin_port = htons(UDPBD_PORT);
         si_me.sin_addr.s_addr = htonl(INADDR_ANY);
         if (::bind(s, (struct sockaddr*)&si_me, sizeof(si_me) ) == -1) {
+            close(s);
             throw runtime_error("bind");
         }
 
-        // Enable broadcasts
+        // Enable broadcasts.
         int broadcastEnable=1;
         setsockopt(s, SOL_SOCKET, SO_BROADCAST, &broadcastEnable, sizeof(broadcastEnable));
     }
@@ -141,45 +160,57 @@ public:
 
     void run() {
         struct sockaddr_in si_other;
-        socklen_t slen = sizeof(si_other);
         ssize_t recv_len;
         char buf[BUFLEN];
 
         printf("Server running on port %d (0x%x)\n", UDPBD_PORT, UDPBD_PORT);
 
-        // Start server loop
+        // Start server loop.
         while (1) {
-            // Receive command from ps2
+            socklen_t slen = sizeof(si_other);
             if ((recv_len = recvfrom(s, buf, BUFLEN, 0, (struct sockaddr *) &si_other, &slen)) == -1) {
-                throw runtime_error("recvfrom");
+                if (errno == EINTR)
+                    continue;
+                throw runtime_error(string("recvfrom: ") + strerror(errno));
             }
+
+            // Ignore truncated or undersized command packets instead of reading
+            // incomplete structures from the receive buffer.
+            if (recv_len < static_cast<ssize_t>(sizeof(struct SUDPBDv2_Header)))
+                continue;
 
             struct SUDPBDv2_Header *hdr = (struct SUDPBDv2_Header *)buf;
 
-            // Process command
             switch (hdr->cmd) {
                 case UDPBD_CMD_INFO:
-                    handle_cmd_info(si_other, (struct SUDPBDv2_InfoRequest *)buf);
+                    if (recv_len >= static_cast<ssize_t>(sizeof(struct SUDPBDv2_InfoRequest)))
+                        handle_cmd_info(si_other, (struct SUDPBDv2_InfoRequest *)buf);
                     break;
                 case UDPBD_CMD_READ:
-                    handle_cmd_read(si_other, (struct SUDPBDv2_RWRequest *)buf);
+                    if (recv_len >= static_cast<ssize_t>(sizeof(struct SUDPBDv2_RWRequest)))
+                        handle_cmd_read(si_other, (struct SUDPBDv2_RWRequest *)buf);
                     break;
                 case UDPBD_CMD_WRITE:
-                    handle_cmd_write(si_other, (struct SUDPBDv2_RWRequest *)buf);
+                    if (recv_len >= static_cast<ssize_t>(sizeof(struct SUDPBDv2_RWRequest)))
+                        handle_cmd_write(si_other, (struct SUDPBDv2_RWRequest *)buf);
                     break;
                 case UDPBD_CMD_WRITE_RDMA:
-                    handle_cmd_write_rdma(si_other, (struct SUDPBDv2_RDMA *)buf);
+                    if (recv_len >= static_cast<ssize_t>(sizeof(struct SUDPBDv2_Header) + sizeof(union block_type)))
+                        handle_cmd_write_rdma(si_other, (struct SUDPBDv2_RDMA *)buf, static_cast<size_t>(recv_len));
                     break;
                 default:
-                    printf("Invalid cmd: 0x%x\n", hdr->cmd);
+                    if (_verbose)
+                        printf("Invalid cmd: 0x%x\n", hdr->cmd);
             };
         }
     }
 
 private:
     void print_stats() {
-        printf("Total read: %" PRIu64 " KiB, total write: %" PRIu64 " KiB", _total_read/1024, _total_write/1024);
-        fflush(stdout);
+        if (_verbose) {
+            printf("Total read: %" PRIu64 " KiB, total write: %" PRIu64 " KiB", _total_read/1024, _total_write/1024);
+            fflush(stdout);
+        }
     }
 
     void set_block_shift(uint32_t shift) {
@@ -188,14 +219,13 @@ private:
             _block_size        = 1 << (_block_shift + 2);
             _blocks_per_packet = RDMA_MAX_PAYLOAD / _block_size;
             _blocks_per_sector = _bd.get_sector_size() / _block_size;
-            printf("Block size changed to %u\n", _block_size);
+            if (_verbose)
+                printf("Block size changed to %u\n", _block_size);
         }
     }
 
     void set_block_shift_sectors(uint32_t sectors) {
-        // Optimize for:
-        // 1 - the least number of network packets
-        // 2 - the largest block size (faster on the ps2)
+        // Optimize for the least number of network packets, then the largest block size.
         uint32_t shift;
         uint32_t size = sectors * 512;
         uint32_t packetsMIN  = (size + 1440 - 1) / 1440;
@@ -210,7 +240,7 @@ private:
         else if (packets128 == packetsMIN)
             shift = 5; // 128 byte blocks
         else
-            shift = 3; //  32 byte blocks
+            shift = 3; // 32 byte blocks
 
         set_block_shift(shift);
     }
@@ -218,96 +248,97 @@ private:
     void handle_cmd_info(struct sockaddr_in &si_other, struct SUDPBDv2_InfoRequest *request) {
         struct SUDPBDv2_InfoReply reply;
 
-        char str[INET_ADDRSTRLEN];
-        inet_ntop(AF_INET, &si_other.sin_addr, str, INET_ADDRSTRLEN);
+        if (_verbose) {
+            char str[INET_ADDRSTRLEN];
+            inet_ntop(AF_INET, &si_other.sin_addr, str, INET_ADDRSTRLEN);
+            printf("\rUDPBD_CMD_INFO from %s\n", str);
+            print_stats();
+        }
 
-        printf("\rUDPBD_CMD_INFO from %s\n", str);
-        print_stats();
-
-        // Reply header
         reply.hdr.cmd      = UDPBD_CMD_INFO_REPLY;
         reply.hdr.cmdid    = request->hdr.cmdid;
         reply.hdr.cmdpkt   = 1;
-        // Reply info
         reply.sector_size  = _bd.get_sector_size();
         reply.sector_count = _bd.get_sector_count();
 
-        // Send packet to ps2
-        if (sendto(s, &reply, sizeof(reply), 0, (struct sockaddr*) &si_other, sizeof(si_other)) == -1) {
-            throw runtime_error("sendto");
-        }
+        if (sendto(s, &reply, sizeof(reply), 0, (struct sockaddr*) &si_other, sizeof(si_other)) == -1)
+            throw runtime_error(string("sendto: ") + strerror(errno));
     }
 
     void handle_cmd_read(struct sockaddr_in &si_other, struct SUDPBDv2_RWRequest *request) {
         struct SUDPBDv2_RDMA reply;
 
-        printf("\rUDPBD_CMD_READ(cmdId=%d, startSector=%u, sectorCount=%u)\n", request->hdr.cmdid, request->sector_nr, request->sector_count);
+        if (_verbose)
+            printf("\rUDPBD_CMD_READ(cmdId=%d, startSector=%u, sectorCount=%u)\n", request->hdr.cmdid, request->sector_nr, request->sector_count);
 
-        // Optimize RDMA block size for number of sectors
+        // Optimize RDMA block size for number of sectors. The existing protocol
+        // block-size selection is deliberately unchanged.
         set_block_shift_sectors(request->sector_count);
 
-        // Reply header
         reply.hdr.cmd        = UDPBD_CMD_READ_RDMA;
         reply.hdr.cmdid      = request->hdr.cmdid;
         reply.hdr.cmdpkt     = 1;
         reply.bt.block_shift = _block_shift;
 
         uint32_t blocks_left = request->sector_count * _blocks_per_sector;
+        uint64_t read_offset = static_cast<uint64_t>(request->sector_nr) * 512;
 
-        _total_read += blocks_left * _block_size;
+        _total_read += static_cast<uint64_t>(blocks_left) * _block_size;
         print_stats();
 
-        _bd.seek(request->sector_nr);
-
-        // Packet loop
         while (blocks_left > 0) {
             reply.bt.block_count = (blocks_left > _blocks_per_packet) ? _blocks_per_packet : blocks_left;
             blocks_left -= reply.bt.block_count;
 
-            // read data from file
-            _bd.read(reply.data, reply.bt.block_count * _block_size);
+            size_t data_size = reply.bt.block_count * _block_size;
+            _bd.read_at(read_offset, reply.data, data_size);
+            read_offset += data_size;
 
-            // Send packet to ps2
-            if (sendto(s, &reply, sizeof(struct SUDPBDv2_Header) + 4 + (reply.bt.block_count * _block_size), 0, (struct sockaddr*) &si_other, sizeof(si_other)) == -1) {
-                throw runtime_error("sendto");
-            }
+            if (sendto(s, &reply, sizeof(struct SUDPBDv2_Header) + 4 + data_size, 0, (struct sockaddr*) &si_other, sizeof(si_other)) == -1)
+                throw runtime_error(string("sendto: ") + strerror(errno));
             reply.hdr.cmdpkt++;
         }
     }
 
     void handle_cmd_write(struct sockaddr_in &si_other, struct SUDPBDv2_RWRequest *request) {
-        printf("\rUDPBD_CMD_WRITE(cmdId=%d, startSector=%u, sectorCount=%u)\n", request->hdr.cmdid, request->sector_nr, request->sector_count);
+        (void)si_other;
+        if (_verbose)
+            printf("\rUDPBD_CMD_WRITE(cmdId=%d, startSector=%u, sectorCount=%u)\n", request->hdr.cmdid, request->sector_nr, request->sector_count);
 
-        _bd.seek(request->sector_nr);
+        _write_offset = static_cast<uint64_t>(request->sector_nr) * 512;
         _write_size_left = request->sector_count * 512;
 
         _total_write += _write_size_left;
         print_stats();
     }
 
-    void handle_cmd_write_rdma(struct sockaddr_in &si_other, struct SUDPBDv2_RDMA *request) {
+    void handle_cmd_write_rdma(struct sockaddr_in &si_other, struct SUDPBDv2_RDMA *request, size_t packet_size) {
         size_t size = request->bt.block_count * (1 << (request->bt.block_shift + 2));
-        //printf("UDPBD_CMD_WRITE_RDMA(cmdId=%d, BS=%u, BC=%u, size=%zu)\n", request->hdr.cmdid, request->bt.block_shift, request->bt.block_count, size);
+        const size_t header_size = sizeof(struct SUDPBDv2_Header) + sizeof(union block_type);
+        if (size > packet_size - header_size || size > _write_size_left) {
+            if (_verbose)
+                fprintf(stderr, "Ignoring invalid or unexpected write data packet\n");
+            return;
+        }
 
-        _bd.write(request->data, size);
+        _bd.write_at(_write_offset, request->data, size);
+        _write_offset += size;
         _write_size_left -= size;
-        if(_write_size_left == 0) {
+        if (_write_size_left == 0) {
             struct SUDPBDv2_WriteDone reply;
 
-            // Reply header
             reply.hdr.cmd      = UDPBD_CMD_WRITE_DONE;
             reply.hdr.cmdid    = request->hdr.cmdid;
             reply.hdr.cmdpkt   = request->hdr.cmdid + 1;
             reply.result       = 0;
 
-            // Send packet to ps2
-            if (sendto(s, &reply, sizeof(reply), 0, (struct sockaddr*) &si_other, sizeof(si_other)) == -1) {
-                throw runtime_error("sendto");
-            }
+            if (sendto(s, &reply, sizeof(reply), 0, (struct sockaddr*) &si_other, sizeof(si_other)) == -1)
+                throw runtime_error(string("sendto: ") + strerror(errno));
         }
     }
 
     class CBlockDevice &_bd;
+    bool _verbose;
     uint32_t _block_shift;
     uint32_t _block_size;
     uint32_t _blocks_per_packet;
@@ -318,22 +349,37 @@ private:
     uint64_t _total_write;
 
     uint32_t _write_size_left;
+    uint64_t _write_offset;
 };
 
 int main(int argc, char * argv[])
 {
-    if (argc < 2) {
+    const char *image = NULL;
+    bool verbose = true;
+    for (int i = 1; i < argc; ++i) {
+        if (strcmp(argv[i], "-q") == 0 || strcmp(argv[i], "--quiet") == 0)
+            verbose = false;
+        else if (image == NULL)
+            image = argv[i];
+        else {
+            fprintf(stderr, "Unexpected argument: %s\n", argv[i]);
+            image = NULL;
+            break;
+        }
+    }
+
+    if (image == NULL) {
         printf("Usage:\n");
-        printf("  %s <file>\n", argv[0]);
+        printf("  %s [--quiet|-q] <file>\n", argv[0]);
         return -1;
     }
 
     try {
-        class CBlockDevice bd(argv[1]);
-        class CUDPBDServer srv(bd);
+        class CBlockDevice bd(image, verbose);
+        class CUDPBDServer srv(bd, verbose);
         srv.run();
     } catch (exception& e) {
-        cout<<e.what()<<'\n';
+        cerr << e.what() << '\n';
         return -2;
     }
 
